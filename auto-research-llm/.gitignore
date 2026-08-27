@@ -1,0 +1,18 @@
+# Ignore user credentials and personal keys
+user_info.json
+
+# Ignore experiment outputs and model check-points
+experiment_logs/
+outputs/
+checkpoints/
+*.ckpt
+*.bin
+*.pt
+*.safetensors
+
+# Ignore python cache
+__pycache__/
+*.pyc
+
+# Ignore macOS metadata
+.DS_Store

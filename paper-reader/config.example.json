@@ -1,0 +1,9 @@
+{
+  "obsidian_vault": "",
+  "llm": {
+    "api_key": "",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat"
+  },
+  "marker_bin": ""
+}

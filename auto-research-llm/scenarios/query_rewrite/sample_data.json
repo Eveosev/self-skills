@@ -1,0 +1,17 @@
+[
+  {
+    "prompt": "Rewrite the following search query to improve retrieval for ecommerce search: 'red dress for summer wedding'",
+    "input": "",
+    "output": "red summer wedding dress, formal red dresses for summer outdoor wedding"
+  },
+  {
+    "prompt": "Rewrite the following search query to improve retrieval for ecommerce search: 'noise canceling headphones under 100'",
+    "input": "",
+    "output": "affordable active noise cancelling headphones, wireless ANC headphones under $100"
+  },
+  {
+    "prompt": "Rewrite the following search query to improve retrieval for ecommerce search: 'best gaming laptop 2026'",
+    "input": "",
+    "output": "top rated gaming laptops 2026, RTX gaming notebooks performance comparison"
+  }
+]

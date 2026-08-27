@@ -1,0 +1,21 @@
+{
+  "master_addr": "10.0.0.1",
+  "master_port": 29500,
+  "nodes": [
+    {
+      "node_rank": 0,
+      "node_addr": "10.0.0.1",
+      "gpus": 8
+    },
+    {
+      "node_rank": 1,
+      "node_addr": "10.0.0.2",
+      "gpus": 8
+    }
+  ],
+  "env": {
+    "NCCL_DEBUG": "INFO",
+    "NCCL_IB_DISABLE": 0,
+    "OMP_NUM_THREADS": 4
+  }
+}
