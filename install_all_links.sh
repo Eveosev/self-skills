@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+FORCE=0
+if [ "${1:-}" = "--force" ]; then
+  FORCE=1
+elif [ "$#" -gt 0 ]; then
+  echo "Usage: $0 [--force]" >&2
+  exit 2
+fi
+
 # Dynamically resolve script's directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_SKILLS_DIR="${WORKSPACE_SKILLS_DIR:-$SCRIPT_DIR}"
@@ -27,43 +35,36 @@ for skill in "${SKILLS[@]}"; do
 
   echo "Linking skill: $skill"
 
-  # Link to Cursor
-  ln -sfh "$src_dir" "$HOME/.cursor/skills/$skill"
-  echo "  -> Linked to Cursor: $HOME/.cursor/skills/$skill"
+  link_skill() {
+    local target="$1"
+    local label="$2"
+    if [ -L "$target" ]; then
+      if [ "$(readlink "$target")" = "$src_dir" ]; then
+        echo "  -> Already linked to $label: $target"
+        return
+      fi
+      if [ "$FORCE" -ne 1 ]; then
+        echo "  !! Conflict at $target (use --force to replace)" >&2
+        return 1
+      fi
+      rm "$target"
+    elif [ -e "$target" ]; then
+      if [ "$FORCE" -ne 1 ]; then
+        echo "  !! Existing non-link at $target (use --force to replace)" >&2
+        return 1
+      fi
+      rm -rf "$target"
+    fi
+    ln -s "$src_dir" "$target"
+    echo "  -> Linked to $label: $target"
+  }
 
-  # Link to Antigravity / Gemini
-  ln -sfh "$src_dir" "$HOME/.gemini/config/skills/$skill"
-  echo "  -> Linked to Antigravity: $HOME/.gemini/config/skills/$skill"
-  ln -sfh "$src_dir" "$HOME/.gemini/skills/$skill"
-  echo "  -> Linked to Gemini: $HOME/.gemini/skills/$skill"
-
-  # Link to Claude Code
-  ln -sfh "$src_dir" "$HOME/.claude/skills/$skill"
-  echo "  -> Linked to Claude Code: $HOME/.claude/skills/$skill"
-
-  # Link to Codex
-  ln -sfh "$src_dir" "$HOME/.codex/skills/$skill"
-  echo "  -> Linked to Codex: $HOME/.codex/skills/$skill"
+  link_skill "$HOME/.cursor/skills/$skill" "Cursor"
+  link_skill "$HOME/.gemini/config/skills/$skill" "Antigravity/Gemini config"
+  link_skill "$HOME/.gemini/skills/$skill" "Gemini"
+  link_skill "$HOME/.claude/skills/$skill" "Claude Code"
+  link_skill "$HOME/.codex/skills/$skill" "Codex"
 done
 
-# 2. Update ~/.codex/AGENTS.md
-CODEX_AGENTS_FILE="$HOME/.codex/AGENTS.md"
-mkdir -p "$(dirname "$CODEX_AGENTS_FILE")"
-
-cat << INNER_EOF > "$CODEX_AGENTS_FILE"
-# Codex Global Agent Rules & Skills
-
-Here are the custom skills linked for Codex:
-
-- **paper-reader**: 跨机器、跨客户端的论文/博客阅读分析与网页轻量总结。
-  参见技能说明: $WORKSPACE_SKILLS_DIR/paper-reader/SKILL.md
-- **auto-research-llm**: Automated LLM Research framework for dataset preparation, training (SFT, LoRA, Distillation, DPO, GRPO), evaluation, and tracking.
-  参见技能说明: $WORKSPACE_SKILLS_DIR/auto-research-llm/SKILL.md
-- **dataset-to-s3**: Tool for uploading and archiving datasets to S3.
-  参见技能说明: $WORKSPACE_SKILLS_DIR/dataset-to-s3/SKILL.md
-- **obsidian-clipper**: Tool for clipping web content and saving to Obsidian.
-  参见技能说明: $WORKSPACE_SKILLS_DIR/obsidian-clipper/SKILL.md
-INNER_EOF
-
-echo "  -> Updated Codex configuration: $CODEX_AGENTS_FILE"
+echo "Codex AGENTS.md 未被修改。请按各 skill 的客户端说明手动引用需要启用的 SKILL.md。"
 echo "All Skills symlinked successfully!"

@@ -128,24 +128,43 @@ def _run_marker_once(marker_bin: str, pdf_path: Path, extracted_root: Path, proc
 
 def run_mineru(mineru_bin: str, pdf_path: Path, extracted_root: Path) -> Path:
     """
-    运行 MinerU (magic-pdf), 返回生成的 markdown 文件路径(彻底失败则返回 None)。
-    MinerU 采用 YOLOv8 进行精准版面识别 + UniMERNet 公式转录 + TableMaster/RapidTable 表格解析。
+    运行不同代际的 MinerU CLI, 返回生成的 markdown 文件路径。
+
+    MinerU 的 CLI 在不同版本间从 magic-pdf 风格参数迁移到了 mineru-kit
+    子命令。这里保留多个候选命令，避免安装成功后因为 CLI 代际不同而静默降级。
     """
     extracted_root.mkdir(parents=True, exist_ok=True)
-    cmd = [mineru_bin, "-p", str(pdf_path), "-o", str(extracted_root), "-m", "auto"]
-    print(f"正在运行 MinerU (magic-pdf) 提取高精文本、公式与图片: {' '.join(cmd)}")
+    before = {p.resolve() for p in extracted_root.rglob("*.md")}
+    binary_name = Path(mineru_bin).name
+    modern_commands = [
+        [mineru_bin, "parse", "PDF", str(pdf_path), "--output", str(extracted_root),
+         "--format", "markdown", "--tier", "basic", "--ocr-mode", "auto"],
+        [mineru_bin, "parse", str(pdf_path), "--output", str(extracted_root),
+         "--format", "markdown", "--tier", "basic", "--ocr-mode", "auto"],
+        [mineru_bin, "parse", "-p", str(pdf_path), "-o", str(extracted_root)],
+    ]
+    legacy_command = [mineru_bin, "-p", str(pdf_path), "-o", str(extracted_root), "-m", "auto"]
+    commands = modern_commands + [legacy_command] if binary_name == "mineru-kit" else [legacy_command] + modern_commands
+
     env = os.environ.copy()
     env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    if result.returncode != 0:
-        print(f"MinerU 执行失败(returncode={result.returncode}): {result.stderr[-500:]}", file=sys.stderr)
-        return None
+    last_error = ""
+    for cmd in commands:
+        print(f"正在运行 MinerU 提取高精文本、公式与图片: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            last_error = result.stderr[-500:] or result.stdout[-500:]
+            continue
 
-    stem = pdf_path.stem
-    candidate_mds = list(extracted_root.glob(f"{stem}/*/{stem}.md"))
-    if not candidate_mds:
-        candidate_mds = list(extracted_root.glob(f"{stem}*/**/*.md"))
-    return candidate_mds[0] if candidate_mds else None
+        candidate_mds = [p for p in extracted_root.rglob("*.md") if p.resolve() not in before]
+        if not candidate_mds:
+            candidate_mds = list(extracted_root.rglob(f"{pdf_path.stem}*.md"))
+        if candidate_mds:
+            return sorted(candidate_mds)[0]
+
+    if last_error:
+        print(f"MinerU 执行失败: {last_error}", file=sys.stderr)
+    return None
 
 
 def collect_mineru_images(mineru_md_path: Path) -> list:

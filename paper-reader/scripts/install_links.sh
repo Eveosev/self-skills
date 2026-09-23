@@ -4,6 +4,14 @@
 # 客户端中使用同一份 skill, 无需重复复制文件。
 set -euo pipefail
 
+FORCE=0
+if [ "${1:-}" = "--force" ]; then
+  FORCE=1
+elif [ "$#" -gt 0 ]; then
+  echo "用法: $0 [--force]" >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -18,9 +26,22 @@ link_if_possible() {
   fi
 
   mkdir -p "$target_dir"
-  if [ -L "$link_path" ] || [ -e "$link_path" ]; then
-    echo "已存在, 跳过 $label: $link_path"
-    return
+  if [ -L "$link_path" ]; then
+    if [ "$(readlink "$link_path")" = "$SKILL_DIR" ]; then
+      echo "已接入 $label: $link_path -> $SKILL_DIR"
+      return
+    fi
+    if [ "$FORCE" -ne 1 ]; then
+      echo "冲突 $label: $link_path 已指向 $(readlink "$link_path") (使用 --force 才替换)" >&2
+      return 1
+    fi
+    rm "$link_path"
+  elif [ -e "$link_path" ]; then
+    if [ "$FORCE" -ne 1 ]; then
+      echo "冲突 $label: $link_path 已存在且不是软链接 (使用 --force 才替换)" >&2
+      return 1
+    fi
+    rm -rf "$link_path"
   fi
 
   ln -s "$SKILL_DIR" "$link_path"

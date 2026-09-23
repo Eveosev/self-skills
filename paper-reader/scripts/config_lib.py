@@ -226,10 +226,10 @@ def get_openai_client(config: dict):
 
 def find_mineru_binary(config: dict = None) -> str:
     """
-    探测顺序: PATH (shutil.which) -> config['mineru_bin'] -> 常见安装路径。
+    探测顺序: PATH (mineru-kit/mineru/magic-pdf) -> config['mineru_bin'] -> 常见安装路径。
     找不到返回 None。
     """
-    on_path = shutil.which("magic-pdf") or shutil.which("mineru")
+    on_path = shutil.which("mineru-kit") or shutil.which("mineru") or shutil.which("magic-pdf")
     if on_path:
         return on_path
 
