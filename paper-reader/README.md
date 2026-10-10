@@ -6,8 +6,8 @@
 
 | 角色 | 职责 |
 |---|---|
-| `scripts/*.py` | 拉元数据、下 PDF、MinerU/Marker 提取、拷贝 assets、写 `bundle.json` |
-| **Agent(当前会话模型)** | 读 bundle + `prompts/*.md`, 分类并生成笔记、落盘 |
+| `scripts/*.py` | 拉元数据、下 PDF、MinerU/Marker 提取、拷贝 assets、浅克隆关联仓库、写 `bundle.json` |
+| **Agent(当前会话模型)** | 读论文与仓库清单/源码，分类并生成笔记、落盘 |
 
 默认**不**调用外部 LLM API, 因此在 Cursor 等 Agent 框架内使用时无需配置
 京东云 / DeepSeek 等密钥; 笔记由调度本 skill 的同一个模型完成。
@@ -43,6 +43,10 @@ uv pip install --python .venv/bin/python mineru
 ```
 
 深度解析没有可用 MinerU 时会降级为摘要模式；这只用于排查环境，不代表完整安装成功。Marker 可作为兼容后备，但不是 MinerU 的替代安装步骤。
+论文正文或摘要明确给出 GitHub URL 时，脚本会用 `git clone --depth 1
+--filter=blob:none --no-tags` 把公开仓库放到 `extracted/<paper>/code/`，记录固定
+commit、README、关键文件、语言统计和文件树。它不会猜测仓库，也不会执行仓库
+中的安装脚本或程序；克隆失败只记录到 bundle，不中断论文流程。
 
 Obsidian Vault 路径解析优先级: 环境变量 `NOTES_VAULT` > config 中的
 `obsidian_vault` > 自动探测本仓库 git 根目录(在本仓库内直接用无需配置)。

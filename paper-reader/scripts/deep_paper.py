@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import arxiv
 
@@ -30,6 +31,27 @@ import config_lib as cfg
 
 ARXIV_ID_RE = re.compile(r'(\d{4}\.\d{4,5})(v\d+)?')
 IMAGE_EXTS = {".jpeg", ".jpg", ".png"}
+GITHUB_URL_RE = re.compile(r'https?://(?:www\.)?github\.com/[^\s<>"\']+', re.IGNORECASE)
+GITHUB_RESERVED_OWNERS = {
+    "about", "apps", "collections", "contact", "customer-stories", "enterprise",
+    "events", "explore", "features", "issues", "login", "marketplace", "new",
+    "notifications", "orgs", "pricing", "search", "security", "settings", "site",
+    "sponsors", "team", "topics", "trending", "users",
+}
+LANGUAGE_BY_SUFFIX = {
+    ".c": "C", ".cc": "C++", ".cpp": "C++", ".cs": "C#", ".css": "CSS",
+    ".go": "Go", ".h": "C/C++ Header", ".hpp": "C++ Header", ".html": "HTML",
+    ".java": "Java", ".js": "JavaScript", ".jsx": "JavaScript",
+    ".kt": "Kotlin", ".lua": "Lua", ".m": "Objective-C", ".md": "Markdown",
+    ".php": "PHP", ".py": "Python", ".r": "R", ".rb": "Ruby", ".rs": "Rust",
+    ".scala": "Scala", ".sh": "Shell", ".sql": "SQL", ".swift": "Swift",
+    ".tex": "TeX", ".ts": "TypeScript", ".tsx": "TypeScript", ".vue": "Vue",
+}
+KEY_FILE_NAMES = {
+    "Dockerfile", "Makefile", "Pipfile", "environment.yml", "go.mod", "package.json",
+    "poetry.lock", "pyproject.toml", "requirements.txt", "setup.cfg", "setup.py",
+    "uv.lock",
+}
 
 # marker 的默认处理器管线里, EquationProcessor / LLMEquationProcessor 在部分
 # 环境(观测到于某些 torch + Apple Silicon MPS 组合)下会在公式 OCR 阶段稳定
@@ -65,6 +87,202 @@ SAFE_PROCESSORS = ",".join([
 
 PROMPTS_DIR = cfg.SKILL_DIR / "prompts"
 ANALYZE_TEMPLATE_PATH = PROMPTS_DIR / "analyze_paper.md"
+
+
+def normalize_github_repository_url(raw_url: str):
+    """将 GitHub 仓库内链接规范化为仓库根 URL；非仓库链接返回 None。"""
+    cleaned = unquote(raw_url.strip().rstrip(".,;:!?)]}>\"'，。；：！？）】》」』"))
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() not in {
+        "github.com", "www.github.com"
+    }:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2 or parts[0].lower() in GITHUB_RESERVED_OWNERS:
+        return None
+    owner, repo = parts[0], parts[1]
+    if repo.lower().endswith(".git"):
+        repo = repo[:-4]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+", repo
+    ):
+        return None
+    return f"https://github.com/{owner}/{repo}"
+
+
+def extract_github_repository_urls(*texts: str) -> list:
+    """从论文元数据或正文中提取明确出现的 GitHub 仓库，按出现顺序去重。"""
+    repositories = []
+    seen = set()
+    for text in texts:
+        for match in GITHUB_URL_RE.finditer(text or ""):
+            url = normalize_github_repository_url(match.group(0))
+            if url and url.lower() not in seen:
+                seen.add(url.lower())
+                repositories.append(url)
+    return repositories
+
+
+def _run_git(args: list, cwd: Path = None, timeout: int = 20) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "git command failed").strip())
+    return result.stdout.strip()
+
+
+def _repository_files(repo_path: Path, limit: int = 2000) -> list:
+    files = []
+    for path in sorted(repo_path.rglob("*")):
+        if ".git" in path.parts or not path.is_file():
+            continue
+        files.append(path.relative_to(repo_path).as_posix())
+        if len(files) >= limit:
+            break
+    return files
+
+
+def _select_key_files(files: list, limit: int = 40) -> list:
+    package_roots = {
+        Path(rel).parts[0]
+        for rel in files
+        if len(Path(rel).parts) == 2 and Path(rel).name == "__init__.py"
+    }
+    primary_roots = {
+        root for root in package_roots
+        if root.lower() not in {"benchmarks", "docs", "examples", "plugins", "scripts", "tests"}
+    }
+    candidates = []
+    for rel in files:
+        path = Path(rel)
+        name_lower = path.name.lower()
+        is_entrypoint = path.stem.lower() in {"app", "cli", "main", "server", "train"}
+        is_source = path.parts and (
+            path.parts[0] in package_roots
+            or path.parts[0].lower() in {
+                "app", "cmd", "lib", "package", "packages", "server", "src"
+            }
+        )
+        if path.parent == Path(".") and (
+            path.name in KEY_FILE_NAMES or name_lower.startswith("readme")
+        ):
+            priority = 0
+        elif path.parts and path.parts[0] in primary_roots:
+            priority = 1
+        elif is_entrypoint:
+            priority = 2
+        elif path.name in KEY_FILE_NAMES or name_lower.startswith("readme") or is_source:
+            priority = 3
+        else:
+            continue
+        if path.suffix.lower() in LANGUAGE_BY_SUFFIX or path.name in KEY_FILE_NAMES:
+            candidates.append((priority, rel))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [rel for _, rel in candidates[:limit]]
+
+
+def build_repository_manifest(url: str, repo_path: Path) -> dict:
+    """只读取已克隆仓库，生成供 Agent 解读的结构化清单。"""
+    repo_path = Path(repo_path).resolve()
+    files = _repository_files(repo_path)
+    readme_files = [rel for rel in files if Path(rel).name.lower().startswith("readme")]
+    languages = {}
+    for rel in files:
+        language = LANGUAGE_BY_SUFFIX.get(Path(rel).suffix.lower())
+        if language:
+            languages[language] = languages.get(language, 0) + 1
+    languages = dict(sorted(languages.items(), key=lambda item: (-item[1], item[0])))
+
+    try:
+        commit = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        commit = ""
+    try:
+        default_branch = _run_git(["symbolic-ref", "--short", "HEAD"], cwd=repo_path)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        default_branch = ""
+
+    tree_path = repo_path.parent / f"{repo_path.name}.tree.txt"
+    manifest_path = repo_path.parent / f"{repo_path.name}.manifest.json"
+    tree_path.write_text("\n".join(files) + ("\n" if files else ""), encoding="utf-8")
+
+    manifest = {
+        "url": url,
+        "clone_path": str(repo_path),
+        "status": "cloned",
+        "commit": commit,
+        "default_branch": default_branch,
+        "readme_files": readme_files,
+        "key_files": _select_key_files(files),
+        "languages": languages,
+        "file_count": len(files),
+        "tree_path": str(tree_path),
+        "manifest_path": str(manifest_path),
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def prepare_code_repositories(text: str, bundle_dir: Path, timeout: int = 120) -> list:
+    """发现并浅克隆论文明确链接的 GitHub 仓库；单仓失败不影响论文流程。"""
+    bundle_dir = Path(bundle_dir)
+    urls = extract_github_repository_urls(text)
+    if not urls:
+        return []
+
+    code_dir = bundle_dir / "code"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    repositories = []
+    used_names = set()
+    for url in urls:
+        owner, repo_name = url.rstrip("/").split("/")[-2:]
+        clone_name = repo_name
+        if clone_name.lower() in used_names:
+            clone_name = f"{owner}__{repo_name}"
+        used_names.add(clone_name.lower())
+        clone_path = code_dir / clone_name
+        try:
+            if not (clone_path / ".git").exists():
+                if clone_path.exists():
+                    clone_path = code_dir / f"{owner}__{repo_name}"
+                result = subprocess.run(
+                    [
+                        "git", "clone", "--depth", "1", "--filter=blob:none", "--no-tags",
+                        url, str(clone_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
+                )
+                if result.returncode != 0:
+                    raise RuntimeError((result.stderr or result.stdout or "git clone failed").strip())
+            manifest = build_repository_manifest(url, clone_path)
+            repositories.append(manifest)
+            print(f"关联代码已准备: {url} @ {manifest['commit'][:12]}")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            error = str(exc)
+            repositories.append({
+                "url": url,
+                "clone_path": str(clone_path.resolve()),
+                "status": "error",
+                "error": error[-1000:],
+                "commit": "",
+                "default_branch": "",
+                "readme_files": [],
+                "key_files": [],
+                "languages": {},
+                "tree_path": "",
+                "manifest_path": "",
+            })
+            print(f"关联代码准备失败，论文流程继续: {url}: {error}", file=sys.stderr)
+    return repositories
 
 
 def parse_arxiv_id(url_or_id: str) -> str:
@@ -232,7 +450,14 @@ def classify_category(client, model: str, title: str, abstract: str, categories:
         return "Inbox"
 
 
-def build_generation_prompt(template_text: str, meta: dict, full_text: str, slug: str, image_files: list) -> str:
+def build_generation_prompt(
+    template_text: str,
+    meta: dict,
+    full_text: str,
+    slug: str,
+    image_files: list,
+    code_repositories: list = None,
+) -> str:
     if image_files:
         image_list_str = "\n".join(f"- {name}" for name in image_files)
         image_reminder = f"""
@@ -248,6 +473,24 @@ def build_generation_prompt(template_text: str, meta: dict, full_text: str, slug
     else:
         image_reminder = "\n## 关于插图\n本文没有可用图片, 不需要插图。\n"
 
+    available_repositories = [
+        repo for repo in (code_repositories or []) if repo.get("status") == "cloned"
+    ]
+    if available_repositories:
+        repository_context = "\n## 关联代码仓库\n\n"
+        for repo in available_repositories:
+            repository_context += (
+                f"- URL: {repo['url']}\n"
+                f"  - commit: {repo.get('commit', '')}\n"
+                f"  - clone_path: {repo.get('clone_path', '')}\n"
+                f"  - manifest_path: {repo.get('manifest_path', '')}\n"
+                f"  - tree_path: {repo.get('tree_path', '')}\n"
+                f"  - README: {', '.join(repo.get('readme_files') or []) or '(无)'}\n"
+                f"  - 关键文件: {', '.join(repo.get('key_files') or []) or '(无)'}\n"
+            )
+    else:
+        repository_context = "\n## 关联代码仓库\n论文未提供可读取的 GitHub 仓库，不输出“关联代码解读”章节。\n"
+
     context = f"""
 ## 运行时上下文
 
@@ -261,11 +504,22 @@ def build_generation_prompt(template_text: str, meta: dict, full_text: str, slug
 
 {full_text}
 """
-    return template_text + "\n\n" + context + image_reminder
+    return template_text + "\n\n" + context + image_reminder + repository_context
 
 
-def generate_note(client, model: str, template_text: str, meta: dict, full_text: str, slug: str, image_files: list) -> str:
-    prompt = build_generation_prompt(template_text, meta, full_text, slug, image_files)
+def generate_note(
+    client,
+    model: str,
+    template_text: str,
+    meta: dict,
+    full_text: str,
+    slug: str,
+    image_files: list,
+    code_repositories: list = None,
+) -> str:
+    prompt = build_generation_prompt(
+        template_text, meta, full_text, slug, image_files, code_repositories
+    )
     print("正在调用 LLM 生成深度学术笔记...")
     content = client.chat(
         messages=[{"role": "user", "content": prompt}],
@@ -376,7 +630,8 @@ def write_bundle(bundle_dir: Path, bundle: dict) -> Path:
     print(f"已写出准备包: {bundle_path}")
     print(
         "下一步(Agent): 读取 template_path 与 full_text_path, 用当前会话模型按 "
-        "prompts/analyze_paper.md 的 Layout 生成中文学术笔记, 写入 "
+        "prompts/analyze_paper.md 的 Layout 生成中文学术笔记；若 code_repositories "
+        "含成功克隆项，静态读取其 manifest/tree/README/关键源码并加入“关联代码解读”。写入 "
         f"{bundle.get('papers_subdir', '20_Papers')}/<category>/<标题>.md "
         "(category 从 categories 中选, 或用 category_override; 无合适则 Inbox)。"
         "不要调用外部 LLM API。"
@@ -461,6 +716,9 @@ def prepare_arxiv(
 
     categories = cfg.get_paper_categories(vault_path, papers_subdir)
     assets_dir = vault_path / "assets" / slug
+    code_repositories = prepare_code_repositories(
+        "\n".join([meta.get("abstract") or "", full_text]), bundle_dir
+    )
 
     bundle = {
         "mode": "deep_paper",
@@ -477,6 +735,7 @@ def prepare_arxiv(
         "full_text_path": str(full_text_path),
         "full_text_chars": len(full_text),
         "image_files": image_files,
+        "code_repositories": code_repositories,
         "assets_dir": str(assets_dir),
         "assets_rel": f"assets/{slug}",
         "template_path": str(ANALYZE_TEMPLATE_PATH),
@@ -577,6 +836,7 @@ def prepare_local_pdf(
 
     categories = cfg.get_paper_categories(vault_path, papers_subdir)
     assets_dir = vault_path / "assets" / slug
+    code_repositories = prepare_code_repositories(full_text, bundle_dir)
 
     bundle = {
         "mode": "deep_paper",
@@ -593,6 +853,7 @@ def prepare_local_pdf(
         "full_text_path": str(full_text_path),
         "full_text_chars": len(full_text),
         "image_files": image_files,
+        "code_repositories": code_repositories,
         "assets_dir": str(assets_dir),
         "assets_rel": f"assets/{slug}",
         "template_path": str(ANALYZE_TEMPLATE_PATH),
@@ -622,6 +883,7 @@ def generate_note_from_bundle(
     papers_subdir = bundle.get("papers_subdir") or "20_Papers"
     full_text = Path(bundle["full_text_path"]).read_text(encoding="utf-8")
     image_files = bundle.get("image_files") or []
+    code_repositories = bundle.get("code_repositories") or []
     categories = bundle.get("categories") or []
 
     category = bundle.get("category_override") or classify_category(
@@ -630,7 +892,9 @@ def generate_note_from_bundle(
     print(f"分类: {category}")
 
     template_text = ANALYZE_TEMPLATE_PATH.read_text(encoding="utf-8")
-    note_content = generate_note(client, model, template_text, meta, full_text, slug, image_files)
+    note_content = generate_note(
+        client, model, template_text, meta, full_text, slug, image_files, code_repositories
+    )
     dest = save_note(
         vault_path,
         category,
